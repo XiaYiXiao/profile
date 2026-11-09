@@ -1,0 +1,28 @@
+{
+  "version": "0.32.1rc1.dev223",
+  "runtime_version": "0.32.1rc1.dev223+gdb3b0f0fa.d20261029",
+  "source_bundle": "/host/profiler/v0.31.0",
+  "patch_sha256": "a40003fc25adcd48e44b70afd8c7412656e70ce5d95a7868756be54943de118b",
+  "files": [
+    {
+      "path": "model_executor/models/mimo_v2.py",
+      "before_sha256": "92282830610eceaa1063c8b3ad855f674bb3f0c27a454e0ad8cdf7de7b2d0067",
+      "after_sha256": "6d6a89f9bf191f5688f1868075ce7a368663d552ca42bda1db240cefafff864c"
+    },
+    {
+      "path": "model_executor/layers/fused_moe/routed_experts.py",
+      "before_sha256": "31e77226425db7eea658e1f273627dca8fb3d423119c3857f8aa5fc6b0d3bd07",
+      "after_sha256": "45f21d7ba4c1584085fafce317ff9749154107aab991bcfc05b3ad0921ef1a35"
+    },
+    {
+      "path": "distributed/eplb/eplb_state.py",
+      "before_sha256": "b52e8fe96b83184aaef04e2303cf1de24056bcceed9fc50803351da970cb8b55",
+      "after_sha256": "750d9c8716c0042782cf2dbfecd9ee48df009d49c106191154bb82a9182f4e6a"
+    },
+    {
+      "path": "distributed/elastic_ep/elastic_execute.py",
+      "before_sha256": "3875c0709143bb0488ffac72177d824bd91220f08a420d9abcd48227b0a0a8b1",
+      "after_sha256": "5ea6b237ed6dd46f537025340759b8cf173e58e23c9bd501e32cebd14e4b4d56"
+    }
+  ]
+}

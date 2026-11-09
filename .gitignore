@@ -8,6 +8,7 @@
 !/aggre_or_not/
 !/performance_eva/
 !/patches/
+!/v0.31.0/
 
 **/__pycache__/
 **/.pytest_cache/
@@ -22,6 +23,7 @@
 **/validation/
 **/backup/
 **/eplb-backups/
+**/vllm-eplb-backup-*/
 *.py[cod]
 .env
 .env.*

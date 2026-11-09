@@ -1,0 +1,6 @@
+CLI dry-run found the correct package through the selected interpreter without importing vLLM.
+Official v0.31.0 BASE -> APPLIED -> restored bytes matched SHA256; modes preserved.
+Repeated install/restore were idempotent.
+Fork-edited files, wrong version, and later changes during restore were rejected without overwrite.
+Package-relative patch application and reverse application matched official before/after hashes.
+No vLLM 0.31.0 GPU startup/inference validation has been performed; remote server files have not been inspected.

@@ -1,0 +1,157 @@
+--- a/model_executor/models/mimo_v2.py
++++ b/model_executor/models/mimo_v2.py
+@@ -187,6 +187,7 @@
+             scoring_func="sigmoid",
+             router_logits_dtype=self.gate.out_dtype,
+         )
++        self.n_local_physical_experts = self.experts.routed_experts.local_num_experts
+ 
+     def forward(self, hidden_states: torch.Tensor) -> torch.Tensor:
+         assert hidden_states.dim() <= 2, "MiMoV2MoE only supports 1D or 2D inputs"
+@@ -953,6 +954,51 @@
+         self.make_empty_intermediate_tensors = (
+             self.model.make_empty_intermediate_tensors
+         )
++        self.set_moe_parameters()
++
++    def set_moe_parameters(self) -> None:
++        self.moe_mlp_layers = [
++            layer.mlp
++            for layer in self.model.layers
++            if isinstance(layer, MiMoV2FlashDecoderLayer)
++            and isinstance(layer.mlp, MiMoV2MoE)
++        ]
++        self.moe_layers = [moe.experts for moe in self.moe_mlp_layers]
++        self.num_moe_layers = len(self.moe_layers)
++        # Weights are registered by set_eplb_state after quantization processing.
++        self.expert_weights = []
++        self.num_shared_experts = 0
++        if not self.moe_mlp_layers:
++            self.num_expert_groups = 0
++            self.num_logical_experts = 0
++            self.num_physical_experts = 0
++            self.num_local_physical_experts = 0
++            self.num_routed_experts = 0
++            self.num_redundant_experts = 0
++            return
++
++        moe = self.moe_mlp_layers[0]
++        self.num_expert_groups = self.model.config.n_group
++        self.num_logical_experts = moe.n_logical_experts
++        self.num_physical_experts = moe.n_physical_experts
++        self.num_local_physical_experts = moe.n_local_physical_experts
++        self.num_routed_experts = moe.n_routed_experts
++        self.num_redundant_experts = moe.n_redundant_experts
++
++    def update_physical_experts_metadata(
++        self,
++        num_physical_experts: int,
++        num_local_physical_experts: int,
++    ) -> None:
++        assert self.num_local_physical_experts == num_local_physical_experts
++        self.num_physical_experts = num_physical_experts
++        self.num_redundant_experts = num_physical_experts - self.num_logical_experts
++        self.model.num_redundant_experts = self.num_redundant_experts
++        for moe in self.moe_mlp_layers:
++            moe.n_physical_experts = num_physical_experts
++            moe.n_local_physical_experts = num_local_physical_experts
++            moe.n_redundant_experts = self.num_redundant_experts
++            moe.experts.update_expert_map()
+ 
+     def embed_input_ids(self, input_ids: torch.Tensor) -> torch.Tensor:
+         return self.model.embed_input_ids(input_ids)
+--- a/model_executor/layers/fused_moe/routed_experts.py
++++ b/model_executor/layers/fused_moe/routed_experts.py
+@@ -1236,7 +1236,14 @@
+         )
+ 
+         return [
+-            weight.view(self.local_num_experts, -1)
++            # MXFP4 scales use E8M0, which ProcessGroupNCCL cannot transfer.
++            # A byte view preserves the scale bits and aliases the parameter,
++            # so EPLB updates are visible to the quantized kernel as well.
++            (
++                weight.view(torch.uint8)
++                if weight.dtype == torch.float8_e8m0fnu
++                else weight
++            ).view(self.local_num_experts, -1)
+             for name, weight in weights
+             if name not in NON_EXPERT_WEIGHTS
+             and weight.shape != torch.Size([])
+--- a/distributed/eplb/eplb_state.py
++++ b/distributed/eplb/eplb_state.py
+@@ -515,7 +515,9 @@
+             communicator=communicator,
+             num_unpadded_tokens_tensors=num_unpadded_tokens_tensors,
+         )
+-        self.model_states[model_config.compute_hash()] = model_state
++        # Use the same stable key as prepare_forward: initialization may still
++        # update the model config after EPLB registers its state.
++        self.model_states[compute_hash_cached(model_config)] = model_state
+ 
+     def prepare_forward(
+         self,
+@@ -1105,7 +1107,7 @@
+         model_config: ModelConfig,
+         expanded_physical_to_logical: torch.Tensor,
+     ) -> None:
+-        eplb_model_state = self.model_states[model_config.compute_hash()]
++        eplb_model_state = self.model_states[compute_hash_cached(model_config)]
+         eplb_model_state.physical_to_logical_map_buffer.copy_(
+             expanded_physical_to_logical
+         )
+@@ -1140,7 +1142,7 @@
+         """Replace physical_to_logical_map and expert_load_pass with views
+         covering the new active size.
+         """
+-        model_state = self.model_states[model_config.compute_hash()]
++        model_state = self.model_states[compute_hash_cached(model_config)]
+         old_num_physical_experts = model_state.model.num_physical_experts
+         first_slot, last_slot = sorted((old_num_physical_experts, num_physical_experts))
+         physical_to_logical_map_buffer = model_state.physical_to_logical_map_buffer
+@@ -1162,7 +1164,7 @@
+     def create_communicator(
+         self, model_config: ModelConfig, group_coordinator: GroupCoordinator
+     ) -> EplbCommunicator:
+-        model_state = self.model_states[model_config.compute_hash()]
++        model_state = self.model_states[compute_hash_cached(model_config)]
+         backend = self.parallel_config.eplb_config.communicator
+         assert backend is not None
+         return create_eplb_communicator(
+@@ -1177,7 +1179,7 @@
+         model_config: ModelConfig,
+         communicator: EplbCommunicator,
+     ) -> None:
+-        self.model_states[model_config.compute_hash()].communicator = communicator
++        self.model_states[compute_hash_cached(model_config)].communicator = communicator
+ 
+ 
+ @dataclass
+--- a/distributed/elastic_ep/elastic_execute.py
++++ b/distributed/elastic_ep/elastic_execute.py
+@@ -15,6 +15,7 @@
+ from vllm.compilation.cuda_graph import CUDAGraphWrapper
+ from vllm.compilation.wrapper import reset_compile_wrapper
+ from vllm.config import ParallelConfig, set_current_vllm_config
++from vllm.config.utils import compute_hash_cached
+ from vllm.distributed import (
+     get_dp_group,
+     get_ep_group,
+@@ -363,7 +364,7 @@
+         eplb_state = self.worker.model_runner.eplb_state
+         assert eplb_state is not None
+         eplb_state.drain_async()
+-        eplb_model_state = eplb_state.model_states[model_config.compute_hash()]
++        eplb_model_state = eplb_state.model_states[compute_hash_cached(model_config)]
+         physical_to_logical = eplb_model_state.physical_to_logical_map_buffer
+         broadcast_expert_mapping(
+             physical_to_logical=physical_to_logical,
+@@ -499,7 +500,7 @@
+         eplb_state = self.worker.model_runner.eplb_state
+         assert eplb_state is not None
+         model_config = self.worker.model_runner.model_config
+-        eplb_model_state = eplb_state.model_states[model_config.compute_hash()]
++        eplb_model_state = eplb_state.model_states[compute_hash_cached(model_config)]
+ 
+         num_physical_experts = num_local_experts * new_ep_size
+         num_logical_experts = eplb_model_state.logical_replica_count.shape[1]
