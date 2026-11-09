@@ -1,0 +1,13 @@
+# Keep experiment sources; generated artifacts and isolated dependencies stay local.
+/aggre/
+/pd/
+/validation/
+/analysis/
+/.cache/
+/.deps/
+/.tmp/
+**/__pycache__/
+*.py[cod]
+*.log
+*.nsys-rep
+*.sqlite*

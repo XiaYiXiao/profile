@@ -1,42 +1,42 @@
-# Publish only reusable scripts and documentation from the approved locations.
-# Results, traces, backups, installation snapshots and caches stay local.
-*
+# Publish only reusable source trees; each module further limits its contents.
+/*
 !/.gitignore
-!/*.md
-!/*.py
-!/*.sh
+!/.gitattributes
+!/README.md
+!/VERSION
+!/profile/
+!/aggre_or_not/
+!/performance_eva/
+!/patches/
 
-!/decode/
-!/decode/*.md
-!/decode/*.py
-!/decode/*.sh
-
-!/ep_profile/
-!/ep_profile/README.md
-!/ep_profile/*.sh
-!/ep_profile/analysis/
-!/ep_profile/analysis/code/
-!/ep_profile/analysis/code/*.py
-!/ep_profile/backends/
-!/ep_profile/backends/*.md
-
-# These one-off scripts require specific historical result directories.
-/ep_profile/analysis/code/compare_batches.py
-/ep_profile/analysis/code/compare_eplb_warmups.py
-
-# Defensive exclusions for future files in the source directories.
 **/__pycache__/
+**/.pytest_cache/
+**/.venv*/
+**/.cache/
+**/.deps/
+**/.tmp/
+**/deployments/
+**/results/
+**/outputs/
+**/captures/
+**/validation/
+**/backup/
+**/eplb-backups/
 *.py[cod]
 .env
 .env.*
 *.log
 *.sqlite*
+*.db
 *.nsys-rep
 *.qdrep
 *.ncu-rep
 *.csv
+*.xlsx
 *.svg
 *.png
 *.tar*
 *.zip
 *.gz
+*.safetensors
+*.bin

@@ -1,0 +1,5 @@
+# Verified with Python 3.12. Keep serving dependencies in the vLLM environment.
+evalscope[perf]==1.14.1
+pandas>=2.2,<4
+openpyxl>=3.1,<4
+click>=8,<9
