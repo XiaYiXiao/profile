@@ -11,7 +11,6 @@ Prefill/Decode 采集及结果分析代码；模型权重、实验结果、日�
 | [aggre_or_not/](aggre_or_not/README.md) | 混部与 PD 分离采集，以及部署复用的进程管理和命令构造 |
 | [profile/](profile/README.md) | Prefill、Decode、EP/EPLB 对照与 Perfetto/Nsight 分析 |
 | [patches/eplb/](patches/eplb/README.md) | MiMo EPLB 最小源码补丁及适用版本说明 |
-| [v0.31.0/](v0.31.0/README.md) | vLLM 0.31.0 EPLB 安装包，以及独立的 0.32 开发版适配包；包含版本/文件哈希检查、安装和回滚工具 |
 | [v0.31.0_eplb/](v0.31.0_eplb/README.md) | 原始 vLLM 0.31.0 EPLB 补丁目录，包含安装脚本和四个补丁源码文件 |
 
 v1 根目录中的采集脚本移入 `profile/`，例如 `decode/capture.sh` 现在是

@@ -1,6 +1,4 @@
 # Unified patch context lines deliberately contain a leading space.
 *.patch whitespace=-blank-at-eol
 # Installer payloads must retain the exact upstream bytes recorded in manifest.json.
-v0.31.0/files/** whitespace=-blank-at-eol
-v0.31.0/adapted-*/files/** whitespace=-blank-at-eol
 v0.31.0_eplb/files/** whitespace=-blank-at-eol
