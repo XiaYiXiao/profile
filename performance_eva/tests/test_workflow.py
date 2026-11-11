@@ -26,8 +26,8 @@ KV = dict(do_remote_prefill=True, remote_engine_id='p', remote_block_ids=[1], re
 
 
 @pytest.mark.parametrize('mode,topology,port', [
-    ('aggre', [(2, 4)], 19000), ('pd', [(2, 2), (4, 1)], 19100),
-    ('pd_6p2d', [(3, 2), (2, 1)], 19200),
+    ('aggre', [(2, 4)], 19000), ('pd', [(2, 2), (2, 2)], 19100),
+    ('pd_6p2d', [(3, 2), (1, 2)], 19200),
 ])
 def test_deployment_dry_run(mode, topology, port, tmp_path):
     env = dict(os.environ, DRY_RUN='1', PYTHON_BIN=sys.executable, OUTPUT_ROOT=str(tmp_path))
@@ -43,7 +43,7 @@ def test_deployment_dry_run(mode, topology, port, tmp_path):
 
 def test_port_overlap_rejected():
     proc = subprocess.run(['bash', str(BASE / 'deploy_pd.sh')],
-                          env=dict(os.environ, DRY_RUN='1', P_NIXL_PORT='6200'), capture_output=True)
+                          env=dict(os.environ, DRY_RUN='1', KV_CONNECTOR='NixlConnector', P_NIXL_PORT='6200'), capture_output=True)
     assert proc.returncode != 0
     assert b'disjoint' in proc.stderr
 
@@ -97,6 +97,98 @@ def test_proxy_failure(failure):
     assert len(called) == (2 if failure == 'decode_error' else 1)
 
 
+def mooncake_registry():
+    return {str(dp): {'engine_id': f'p-dp{dp}',
+                     'worker_addr': {str(tp): {'0': f'127.0.0.1:{7000 + dp * 2 + tp}'}
+                                     for tp in range(2)}}
+            for dp in range(3)}
+
+
+def mooncake_app(upstream):
+    return proxy.create_app('http://prefill', 'http://decode', 10,
+                            httpx.MockTransport(upstream), kv_connector='MooncakeConnector',
+                            prefill_bootstrap_url='http://bootstrap',
+                            prefill_dp_size=3, prefill_tp_size=2)
+
+
+@pytest.mark.parametrize('endpoint', ['/v1/completions', '/v1/chat/completions'])
+@pytest.mark.parametrize('stream', [False, True])
+def test_mooncake_proxy_routes_matching_dp_and_transfer_ids(endpoint, stream):
+    seen = []
+    def upstream(req):
+        if req.url.host == 'bootstrap':
+            assert req.url.path == '/query'
+            return httpx.Response(200, json=mooncake_registry())
+        if req.url.path == '/health':
+            return httpx.Response(200)
+        body = json.loads(req.content)
+        seen.append((req, body))
+        if req.url.host == 'prefill':
+            assert body['max_tokens'] == body['max_completion_tokens'] == 1
+            assert not body['stream'] and 'min_tokens' not in body and 'stream_options' not in body
+            return httpx.Response(200, json={'choices': []})
+        assert body['max_tokens'] == body['max_completion_tokens'] == 4
+        assert 'x-data-parallel-rank' not in req.headers
+        return httpx.Response(200, content=b'data: [DONE]\n\n' if stream else b'{"choices":[]}')
+    with TestClient(mooncake_app(upstream)) as client:
+        assert client.get('/health').status_code == 200
+        for _ in range(4):
+            result = client.post(endpoint, json={'model': 'test', 'prompt': 'hello',
+                                 'messages': [], 'max_tokens': 4, 'max_completion_tokens': 4,
+                                 'min_tokens': 4, 'stream': stream, 'stream_options': {}},
+                                 headers={'x-request-id': 'reused-id', 'session-id': 'session'})
+            assert result.status_code == 200
+            assert result.text == ('data: [DONE]\n\n' if stream else '{"choices":[]}')
+    transfer_ids = []
+    for idx in range(4):
+        (p_req, p_body), (d_req, d_body) = seen[2 * idx:2 * idx + 2]
+        assert p_req.headers['x-data-parallel-rank'] == str(idx % 3)
+        p_kv, d_kv = p_body['kv_transfer_params'], d_body['kv_transfer_params']
+        assert p_kv['do_remote_decode'] and not p_kv['do_remote_prefill']
+        assert d_kv == dict(do_remote_decode=False, do_remote_prefill=True,
+                            remote_bootstrap_addr='http://bootstrap',
+                            remote_engine_id=f'p-dp{idx % 3}', transfer_id=p_kv['transfer_id'])
+        transfer_ids.append(p_kv['transfer_id'])
+        for req in (p_req, d_req):
+            assert req.url.path == endpoint
+            assert req.headers['x-request-id'] == 'reused-id'
+            assert req.headers['session-id'] == 'session'
+    assert len(set(transfer_ids)) == 4
+
+
+@pytest.mark.parametrize('failure', ['empty', 'missing_tp', 'missing_engine', 'invalid_json'])
+def test_mooncake_proxy_rejects_incomplete_bootstrap(failure):
+    registry = mooncake_registry()
+    if failure == 'empty':
+        registry = {}
+    elif failure == 'missing_tp':
+        del registry['1']['worker_addr']['1']
+    elif failure == 'missing_engine':
+        del registry['2']['engine_id']
+    def upstream(req):
+        assert req.url.host == 'bootstrap'
+        return httpx.Response(200, text='invalid') if failure == 'invalid_json' else httpx.Response(200, json=registry)
+    with pytest.raises(RuntimeError, match='Invalid Mooncake bootstrap registry'):
+        with TestClient(mooncake_app(upstream)):
+            pass
+
+
+@pytest.mark.parametrize('failure', ['prefill', 'decode'])
+def test_mooncake_proxy_preserves_upstream_failures(failure):
+    called = []
+    def upstream(req):
+        if req.url.host == 'bootstrap':
+            return httpx.Response(200, json=mooncake_registry())
+        called.append(req.url.host)
+        if req.url.host == 'prefill':
+            return httpx.Response(500 if failure == 'prefill' else 200, json={'choices': []})
+        return httpx.Response(429, json={'error': 'busy'})
+    with TestClient(mooncake_app(upstream)) as client:
+        response = client.post('/v1/completions', json={'prompt': 'test', 'max_tokens': 4})
+    assert response.status_code == (502 if failure == 'prefill' else 429)
+    assert called == (['prefill'] if failure == 'prefill' else ['prefill', 'decode'])
+
+
 @pytest.fixture(scope='module')
 def mock_server():
     app = FastAPI()
@@ -144,7 +236,7 @@ def test_real_evalscope(tmp_path, mock_server, kind):
     else:
         dataset.write_text('hello\nworld\n')
         extra = ['--prepared-dataset-path', str(dataset)] + (['--use-chat'] if kind == 'chat' else [])
-    command = ['bash', str(BASE / 'run_load.sh'), '--results-root', str(tmp_path / 'results'),
+    command = ['bash', str(BASE / 'run_load.sh'), '--no-reset-prefix-cache', '--results-root', str(tmp_path / 'results'),
                '--port', str(mock_server), '--model', 'test-model', '--tokenizer-path', '',
                '--parallel', '1 2', '--number', '2', '--input-length', '5', '--output-length', '3',
                '--loop', '2', '--inject-session-id', '--inject-req-ids', *extra]
@@ -167,7 +259,7 @@ def test_real_evalscope(tmp_path, mock_server, kind):
 def test_concurrent_identical_runs(tmp_path, mock_server):
     data = tmp_path / 'prompts.txt'
     data.write_text('hello\n')
-    cmd = ['bash', str(BASE / 'run_load.sh'), '--results-root', str(tmp_path / 'results'),
+    cmd = ['bash', str(BASE / 'run_load.sh'), '--no-reset-prefix-cache', '--results-root', str(tmp_path / 'results'),
            '--port', str(mock_server), '--model', 'test-model', '--tokenizer-path', '',
            '--prepared-dataset-path', str(data), '--parallel', '1', '--number', '1',
            '--input-length', '5', '--output-length', '3']
@@ -182,6 +274,22 @@ def test_concurrent_identical_runs(tmp_path, mock_server):
     assert len({json.loads(p.read_text())['run_id'] for p in manifests}) == 2
     for path in manifests:
         assert len(pd.read_csv(path.parent / 'perf/summary.csv')) == 1
+
+
+def test_reset_failure_prevents_load_and_is_archived(tmp_path, mock_server):
+    command = ['bash', str(BASE / 'run_load.sh'), '--results-root', str(tmp_path / 'results'),
+               '--port', str(mock_server), '--model', 'test-model', '--tokenizer-path', '',
+               '--parallel', '1', '--number', '1', '--no-server-metrics']
+    result = subprocess.run(command, env=dict(os.environ, LOAD_PYTHON_BIN=sys.executable),
+                            capture_output=True, text=True, timeout=30)
+    assert result.returncode != 0
+    manifest_path, = (tmp_path / 'results').rglob('manifest.json')
+    manifest = json.loads(manifest_path.read_text())
+    assert manifest['status'] == 'failed'
+    assert manifest['prefix_cache_reset']['status'] == 'failed'
+    assert 'load was not started' in manifest['error']
+    assert not (manifest_path.parent / 'perf').exists()
+    assert not (manifest_path.parent / 'server_metrics').exists()
 
 
 def test_direct_output_and_invalid_sweep(tmp_path, monkeypatch):
@@ -224,3 +332,20 @@ def test_failed_metrics_preserve_summary(tmp_path, monkeypatch):
     result = CliRunner().invoke(per_dataset.runner, ['--output-dir', str(root), '--parallel', '1', '--number', '2'])
     assert result.exit_code != 0
     assert (root / 'summary.csv').is_file() and (root / 'summary.xlsx').is_file()
+
+
+def test_load_uses_deployed_tokenizer_with_explicit_override(tmp_path):
+    deployment = tmp_path / 'deployment.json'
+    deployment.write_text(json.dumps(dict(status='ready', deployment_mode='aggre',
+                                         port=19000, model='custom', model_path='/models/custom')))
+    cmd = [sys.executable, str(BASE / 'code/load.py'), '--dry-run',
+           '--deployment', str(deployment)]
+    for extra, expected in [([], '/models/custom'),
+                            (['--tokenizer-path', '/other/tokenizer'], '/other/tokenizer')]:
+        result = subprocess.run(cmd + extra, text=True, capture_output=True, check=True)
+        manifest = json.loads(result.stdout)
+        command = manifest['command']
+        assert command[command.index('--tokenizer-path') + 1] == expected
+        # The default load must fit even the smallest deployment (6P2D).
+        assert (int(command[command.index('--input-length') + 1]) +
+                int(command[command.index('--output-length') + 1])) <= 16384

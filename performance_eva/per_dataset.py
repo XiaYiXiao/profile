@@ -100,6 +100,9 @@ import csv
 import json
 import time
 import uuid
+import hashlib
+import tempfile
+from contextlib import contextmanager
 import click
 import itertools
 import pandas as pd
@@ -374,6 +377,62 @@ def _build_allowed_tokens(tokenizer):
     return np.array(sorted(set(range(full_vocab)) - prohibited))
 
 
+@contextmanager
+def _new_dataset_file(path):
+    """Publish a complete dataset without overwriting an existing file."""
+    path = Path(path)
+    path.parent.mkdir(parents=True, exist_ok=True)
+    with tempfile.NamedTemporaryFile(mode='w', encoding='utf-8', dir=path.parent,
+                                     prefix=f'.{path.name}.', delete=False) as handle:
+        temporary = Path(handle.name)
+        try:
+            yield handle
+            handle.flush()
+            os.link(temporary, path)  # Atomic, and fails if another writer won.
+        finally:
+            temporary.unlink(missing_ok=True)
+
+
+def _fit_single_line_tokens(tokenizer, token_ids, target, allowed, rng):
+    """Match the token count after the same whitespace cleanup as line_by_line."""
+    for _ in range(20):
+        text = tokenizer.decode(token_ids, skip_special_tokens=True)
+        text = text.replace('\n', ' ').replace('\r', ' ').strip()
+        token_ids = tokenizer.encode(text, add_special_tokens=False)
+        if len(token_ids) == target:
+            return text, token_ids
+        if len(token_ids) > target:
+            token_ids = token_ids[:target]
+        else:
+            token_ids += rng.choice(allowed, size=target - len(token_ids)).tolist()
+    raise click.ClickException(f'无法生成精确 {target} token 的单行文本，请更换 seed 或 tokenizer')
+
+
+def _shared_prefix_prompts(tokenizer, allowed, count, prefix_length, in_min, in_max, rng):
+    """Generate unique prompts with an exact, stable token prefix before chat templating."""
+    _, prefix_ids = _fit_single_line_tokens(
+        tokenizer, rng.choice(allowed, size=prefix_length).tolist(),
+        prefix_length, allowed, rng,
+    )
+    seen = set()
+    for _ in range(count):
+        suffix_length = int(rng.integers(in_min, in_max + 1))
+        for _attempt in range(100):
+            candidate = prefix_ids + rng.choice(allowed, size=suffix_length).tolist()
+            text, ids = _fit_single_line_tokens(
+                tokenizer, candidate, prefix_length + suffix_length, allowed, rng,
+            )
+            digest = hashlib.sha256(text.encode('utf-8')).digest()
+            # A suffix can merge with the prefix's final token. Retry instead of
+            # silently changing the common prefix or reusing a complete prompt.
+            if ids[:prefix_length] == prefix_ids and digest not in seen:
+                seen.add(digest)
+                yield text
+                break
+        else:
+            raise click.ClickException('无法生成新的共享前缀请求，请增加后缀长度或更换 seed')
+
+
 def build_random_dataset(
     output_path: str,
     tokenizer_path: str,
@@ -384,6 +443,7 @@ def build_random_dataset(
     turns_min: int = 1,
     turns_max: int = 1,
     seed: int = 42,
+    prefix_length: int = 0,
 ):
     """预生成 random 数据集到本地文件。
 
@@ -395,12 +455,24 @@ def build_random_dataset(
       每条对话的 turn 数从 [turns_min, turns_max] 均匀采样；
       每个 user turn 的内容按 [in_min, in_max] 区间采样 token 序列并 decode。
 
-    复用 evalscope RandomDatasetPlugin 的 allowed_tokens 过滤规则。
-    不做 re-encode round-trip（牺牲 ±2 token 精度换速度）。
+    单轮 prefix_length > 0 时，共享前缀只生成一次；逐条校验重新分词后的
+    prefix_length + suffix_length 和前缀 token 一致性，完整 prompt 不重复。
+    长度不含聊天模板。其他模式保留原有随机采样长度（重新分词后可能变化）。
     """
     import numpy as np
     os.environ['TOKENIZERS_PARALLELISM'] = 'false'
     from evalscope.perf.plugin.datasets.utils import load_tokenizer
+
+    if not output_path:
+        raise click.BadParameter('--prepare-dataset 必须指定非空 --prepared-dataset-path')
+    if Path(output_path).exists():
+        raise click.BadParameter(f'拒绝覆盖已有数据集: {output_path}；直接复用或更换路径')
+    if num_prompts <= 0 or in_min <= 0 or in_max < in_min or prefix_length < 0:
+        raise click.BadParameter('请求数和输入长度必须为正，min <= max，prefix-length >= 0')
+    if multi_turn and prefix_length:
+        raise click.BadParameter('多轮数据集不支持 --prefix-length，请使用单轮模式')
+    if multi_turn and not (1 <= turns_min <= turns_max):
+        raise click.BadParameter('多轮要求 1 <= min-turns <= max-turns')
 
     print(f"[prepare] 加载 tokenizer: {tokenizer_path}")
     tokenizer = load_tokenizer(tokenizer_path)
@@ -421,7 +493,7 @@ def build_random_dataset(
         print(f"[prepare] 多轮模式：{num_prompts} 条对话，每条 turn ∈ [{turns_min}, {turns_max}] "
               f"（总 ≈ {total_turns} turns）→ {output_path}")
         written = 0
-        with open(output_path, 'w', encoding='utf-8') as f:
+        with _new_dataset_file(output_path) as f:
             for conv_idx, n_turns in enumerate(turns_per_conv):
                 # 每条对话的所有 turn 用一次连续采样（一次性 np.random 比逐 turn 循环快）
                 prompts = _sample_random_prompts(
@@ -447,10 +519,18 @@ def build_random_dataset(
         else:
             mode_str = f"区间 [{in_min}, {in_max}] tokens"
         print(f"[prepare] 单轮模式：{num_prompts} 条 prompt ({mode_str}) → {output_path}")
-        with open(output_path, 'w', encoding='utf-8') as f:
-            for i in range(num_prompts):
-                prompts = _sample_random_prompts(tokenizer, allowed, 1, in_min, in_max, rng)
-                f.write(prompts[0] + '\n')
+        if prefix_length:
+            print(f'[prepare] 共享前缀 {prefix_length} tokens + 不同后缀 {mode_str}；'
+                  '逐条校验长度及去重（不含聊天模板）')
+            prompts = _shared_prefix_prompts(
+                tokenizer, allowed, num_prompts, prefix_length, in_min, in_max, rng,
+            )
+        else:
+            prompts = (_sample_random_prompts(tokenizer, allowed, 1, in_min, in_max, rng)[0]
+                       for _ in range(num_prompts))
+        with _new_dataset_file(output_path) as f:
+            for i, prompt in enumerate(prompts):
+                f.write(prompt + '\n')
                 if ((i + 1) % 200 == 0) and (i + 1) < num_prompts:
                     print(f"[prepare] {i + 1}/{num_prompts} 已生成")
 
@@ -568,7 +648,8 @@ def parse_csv_to_xlsx(in_csv, out_xlsx):
     show_default=True,
     help="是否在 URL 里带 :port。关闭时走默认端口 (http 80 / https 443)。",
 )
-@click.option("--rate", type=float, default=-1, show_default=True)
+@click.option("--rate", type=float, default=-1, show_default=True,
+              help="目标调度速率（请求/秒，随机间隔）；-1 不限速，实际发送仍受 parallel 限制")
 @click.option("--parallel", type=str, default="1 4", show_default=True, help="并发数, 请用引号引起来, 如 '1 4'")
 @click.option("--number", type=str, default=None, show_default="1 4", help=(
     "请求数（空格分隔多值，与 --parallel 一一配对）。\n"
@@ -720,7 +801,7 @@ def parse_csv_to_xlsx(in_csv, out_xlsx):
     show_default=True,
     help=(
         "仅预生成 random 数据集到本地文本文件并退出（不跑压测）。\n"
-        "  开启时：调 build_random_dataset(...) 写到 --prepared-dataset-path；\n"
+        "  开启时：写到 --prepared-dataset-path，拒绝覆盖；单轮支持共享 --prefix-length；\n"
         "  关闭时：若 --prepared-dataset-path 已存在则自动用 --dataset line_by_line 复用；\n"
         "          否则走原有的 --dataset random 重新生成（保持原行为）。"
     )
@@ -730,7 +811,7 @@ def parse_csv_to_xlsx(in_csv, out_xlsx):
     type=str,
     default="prompts_random.txt",
     show_default=True,
-    help="预生成数据集的本地路径（同时作为 line_by_line 的输入文件，每行一个 prompt）。"
+    help="数据集本地路径，每行一个完整 prompt；复用时不再追加 prefix 或调整 input-length。"
 )
 @click.option(
     "--prepare-num",
@@ -818,6 +899,7 @@ def runner(
             turns_min=int(min_turns) if multi_turn else 1,
             turns_max=int(max_turns) if multi_turn else 1,
             seed=seed,
+            prefix_length=prefix_length,
         )
         sys.exit(0)
 

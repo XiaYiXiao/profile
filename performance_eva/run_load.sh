@@ -4,4 +4,11 @@
 set -Eeuo pipefail
 export PYTHONDONTWRITEBYTECODE=1
 script_dir="$(cd -- "$(dirname -- "${BASH_SOURCE[0]}")" && pwd)"
-exec "${LOAD_PYTHON_BIN:-python3}" "$script_dir/code/load.py" "$@"
+if [[ -z "${LOAD_PYTHON_BIN:-}" ]]; then
+  if [[ -x "$script_dir/.venv/bin/python" ]]; then
+    LOAD_PYTHON_BIN="$script_dir/.venv/bin/python"
+  else
+    LOAD_PYTHON_BIN=python3
+  fi
+fi
+exec "$LOAD_PYTHON_BIN" "$script_dir/code/load.py" "$@"

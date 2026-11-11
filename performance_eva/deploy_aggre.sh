@@ -15,13 +15,14 @@ export EXPERIMENT_NAME="${EXPERIMENT_NAME:-aggre_dp${DP}_tp${TP}_enable_ep${ENAB
 
 # ==================== 调度 / 显存 / KV ====================
 export MAX_MODEL_LEN="${MAX_MODEL_LEN:-65536}"
-export MAX_NUM_BATCHED_TOKENS="${MAX_NUM_BATCHED_TOKENS:-65536}" MAX_NUM_SEQS="${MAX_NUM_SEQS:-512}"
+export MAX_NUM_BATCHED_TOKENS="${MAX_NUM_BATCHED_TOKENS:-65536}" MAX_NUM_SEQS="${MAX_NUM_SEQS:-32}"
 export GPU_MEMORY_UTILIZATION="${GPU_MEMORY_UTILIZATION:-0.90}"
 export KV_CACHE_LAYOUT="${KV_CACHE_LAYOUT:-LBHNC}" KV_BLOCK_SIZE="${KV_BLOCK_SIZE:-16}"
 export PORT="${PORT:-19000}" DP_RPC_PORT="${DP_RPC_PORT:-31050}" MASTER_PORT="${MASTER_PORT:-31001}"
 
 # ==================== Prefix caching（1 开启 / 0 关闭） ====================
-export ENABLE_PREFIX_CACHING="${ENABLE_PREFIX_CACHING:-0}"
+export ENABLE_PREFIX_CACHING="${ENABLE_PREFIX_CACHING:-1}"
+export ENABLE_RESET_PREFIX_CACHE="${ENABLE_RESET_PREFIX_CACHE:-1}" # 开启镜像 vLLM 的开发接口，供负载前清缓存
 
 # ==================== EP / Attention 后端 ====================
 export MOE_BACKEND="${MOE_BACKEND:-}" ATTENTION_BACKEND="${ATTENTION_BACKEND:-}"
@@ -35,27 +36,38 @@ export EPLB_USE_ASYNC="${EPLB_USE_ASYNC:-true}" EPLB_CONFIG="${EPLB_CONFIG:-}"
 
 # ==================== 投机解码：none / mtp / dflash ====================
 # 与 profiler/profile/decode/capture.sh 接口一致；默认 none 保持普通推理。
-export SPECULATIVE_METHOD="${SPECULATIVE_METHOD:-none}"
+export SPECULATIVE_METHOD="${SPECULATIVE_METHOD:-dflash}"
 export NUM_SPECULATIVE_TOKENS="${NUM_SPECULATIVE_TOKENS:-7}"
-export DRAFT_MODEL_PATH="${DRAFT_MODEL_PATH:-}" # mtp 可空（使用目标模型）；dflash 必须提供 draft 模型
-export SPECULATIVE_CONFIG="${SPECULATIVE_CONFIG:-}" # JSON 额外配置覆盖同名基础参数
-# 合成接受长度实验示例（需先选择 mtp/dflash）：
-# export SPECULATIVE_CONFIG='{"rejection_sample_method":"synthetic","synthetic_acceptance_length":4.2}'
-
+export DRAFT_MODEL_PATH="${DRAFT_MODEL_PATH-/models/MiMo-V2.6-Flash-MOPD/dflash}" # 显式空值用于 MTP；DFlash 必须提供模型
+if [[ ! -v SPECULATIVE_CONFIG ]]; then
+  SPECULATIVE_CONFIG='{
+  "rejection_sample_method": "synthetic",
+  "synthetic_acceptance_length": 4.2
+}'
+  [[ "$SPECULATIVE_METHOD" != none ]] || SPECULATIVE_CONFIG=''
+fi
+export SPECULATIVE_CONFIG
 # ==================== 对外访问 ====================
 export HOST="${HOST:-0.0.0.0}"
-export ENABLE_NSYS=0 # 本入口仅常驻服务，不调度采集
+export ENABLE_NSYS=0 # 不执行 Nsight；服务指标由下面的独立开关控制
+
+# ==================== 服务指标 / 前缀命中率（READY 后自动采集） ====================
+export ENABLE_METRICS="${ENABLE_METRICS:-1}" # 1 开启；0 关闭部署侧采集
+export METRICS_INTERVAL="${METRICS_INTERVAL:-5}" # 周期秒数
+export METRICS_TIMEOUT="${METRICS_TIMEOUT:-3}" # 单次 HTTP 超时秒数
+export METRICS_GPU="${METRICS_GPU:-1}" # 同时采集本次部署 GPU 的利用率/显存
 
 # ==================== 模型 / Python / 超时 ====================
 export MODEL_PATH="${MODEL_PATH:-/models/MiMo-V2.6-Flash-MOPD}"
 export SERVED_MODEL_NAME="${SERVED_MODEL_NAME:-MiMo-V2.6-Flash-MOPD}"
-export PYTHON_BIN="${PYTHON_BIN:-/usr/bin/python3}" VLLM_SOURCE="${VLLM_SOURCE:-/host/vllm}"
+export PYTHON_BIN="${PYTHON_BIN:-/usr/bin/python3}"
+# 只使用镜像安装的包；忽略外部源码和额外 Python 依赖目录。
+unset VLLM_SOURCE DEPS_DIR PYTHONPATH PYTHONHOME
 export STARTUP_TIMEOUT="${STARTUP_TIMEOUT:-3600}" REQUEST_TIMEOUT="${REQUEST_TIMEOUT:-7200}"
 export DRY_RUN="${DRY_RUN:-0}" PREFLIGHT_ONLY="${PREFLIGHT_ONLY:-0}"
 
 # ==================== 部署日志（实验结果由 run_load.sh 管理） ====================
 script_dir="$(cd -- "$(dirname -- "${BASH_SOURCE[0]}")" && pwd)"
 export OUTPUT_ROOT="${OUTPUT_ROOT:-$script_dir}"
-export DEPS_DIR="${DEPS_DIR:-$script_dir/../aggre_or_not/.deps}"
 export DEPLOY_MODE="${DEPLOY_MODE:-aggre}"
-exec "$PYTHON_BIN" "$script_dir/code/deploy.py"
+exec "$PYTHON_BIN" -I "$script_dir/code/deploy.py"

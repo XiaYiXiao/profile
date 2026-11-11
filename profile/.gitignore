@@ -10,6 +10,13 @@
 !/decode/*.md
 !/decode/*.py
 !/decode/*.sh
+!/decode/analysis/
+!/decode/analysis/batch-diagnosis-20261108/
+!/decode/analysis/batch-diagnosis-20261108/*.py
+!/decode/kv-capacity-validation-20261108/
+!/decode/kv-capacity-validation-20261108/*.py
+!/decode/kv-capacity-validation-20261108/hooks/
+!/decode/kv-capacity-validation-20261108/hooks/*.py
 
 !/ep_profile/
 !/ep_profile/README.md
