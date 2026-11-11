@@ -9,6 +9,7 @@
 !/performance_eva/
 !/patches/
 !/v0.31.0/
+!/v0.31.0_eplb/
 
 **/__pycache__/
 **/.pytest_cache/

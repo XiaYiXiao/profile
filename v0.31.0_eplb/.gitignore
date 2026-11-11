@@ -1,0 +1,10 @@
+*
+!/.gitignore
+!/README.md
+!/SHA256SUMS
+!/install.py
+!/manifest.json
+!/runtime.patch
+!/files/
+!/files/**/
+!/files/**/*.py
