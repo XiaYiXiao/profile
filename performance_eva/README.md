@@ -1,14 +1,35 @@
 # 独立模型部署与性能评估
 
-模型部署和负载发射是两个独立进程。部署脚本常驻运行，`run_load.sh` 调用 `per_dataset.py` 发负载并管理实验结果。以下命令在仓库的 `performance_eva` 下执行。请保留同级 `profile` 与 `aggre_or_not` 目录，以便复用公共模块。
+模型部署和负载发射是两个独立进程。部署脚本常驻运行，`run_load.sh` 调用 `per_dataset.py` 发负载并管理实验结果。**可以只上传整个 `performance_eva` 文件夹，无需保留同级 `profile` 或 `aggre_or_not` 目录。**以下命令在上传后的 `performance_eva` 下执行。
+
+## 独立上传与依赖
+
+原先从目录外引用的代码已收录到本目录，运行时只导入本地副本：
+
+| 本地文件 | 用途 | 原始来源（仅记录来源，不是运行依赖） |
+|---|---|---|
+| `code/deploy_common.py` | 参数校验、vLLM 命令构造、模型/GPU/端口预检 | `aggre_or_not/code/collect_pd.py` 中部署所需的函数 |
+| `code/runtime.py` | 子进程启动、跟踪和清理 | `aggre_or_not/code/runtime.py` |
+| `code/eplb_config.py` | EPLB 环境变量与 JSON 配置解析 | `aggre_or_not/code/eplb_config.py` |
+| `code/speculative_config.py` | MTP / DFlash 配置解析 | `profile/decode/speculative_config.py` |
+
+上传时保留根目录的 `.sh`、`per_dataset.py`、`requirements-load.txt` 以及整个 `code/`；建议连同 `README.md` 和 `tests/` 一起复制。`.venv/`、`.venv-load/`、缓存及已有实验输出不必上传，负载环境在目标机器重新创建。
+
+代码依赖已经闭合，运行环境仍需单独准备：
+
+- 部署端使用 Linux、Bash、NVIDIA GPU 与兼容的 vLLM 环境；P/D 还需要所选的 Mooncake 或 NIXL。部署 Python 必须可导入 `prometheus_client`，P/D 代理还需 `fastapi`、`httpx` 和 `uvicorn`；这些由目标镜像提供，不随源码复制。
+- 负载端按 `requirements-load.txt` 安装依赖，现有流程以 Python 3.12 验证。
+- 模型与 tokenizer、启用 DFlash 时的草稿模型、显式指定的数据集仍需放到目标机器，并按实际路径设置 `MODEL_PATH`、`DRAFT_MODEL_PATH`、`--tokenizer-path` 等参数。
+
+先用 `DRY_RUN=1 bash deploy_aggre.sh`（或另外两个部署入口）检查配置，再用 `PREFLIGHT_ONLY=1` 检查部署环境。`tests/test_standalone.py` 会把文件夹复制到独立临时路径，从目录外运行三个部署入口和辅助命令，检查是否仍依赖原仓库。
 
 ## 本容器快速开始
 
 部署使用 `/usr/bin/python3 -I` 和镜像已安装的 vLLM / Mooncake，负载使用独立 `.venv`。
 部署入口会清除 `VLLM_SOURCE`、`DEPS_DIR`、`PYTHONPATH`、`PYTHONHOME`；不加载工作区 vLLM 源码或额外 `.deps`。
-当前镜像版本为 vLLM 0.31.0、mooncake-transfer-engine-cuda13 0.3.13.post1；实际导入路径记录在 `deployment.json` 的 `preflight` 中。
+原验证镜像版本为 vLLM 0.31.0、mooncake-transfer-engine-cuda13 0.3.13.post1；目标机器以 `deployment.json` 的 `preflight` 记录为准。
 `MOE_BACKEND` 默认留空，由镜像 vLLM 自动选择；可通过环境变量显式指定后端。
-Mooncake 默认使用 `rdma`，不根据设备检测自动回退到 TCP；显式 `KV_EXTRA_CONFIG` 可覆盖协议。
+PD 入口当前默认使用 NIXL；显式选择 Mooncake 时默认使用 `rdma`，不根据设备检测自动回退到 TCP，显式 `KV_EXTRA_CONFIG` 可覆盖协议。
 首次运行先安装负载依赖（不会改动部署环境）：
 
 ```bash
@@ -32,13 +53,25 @@ bash run_load.sh --mode aggre --parallel 1 --number 2 \
 更换模型时建议用 `--deployment <READY 输出的 deployment.json>`，自动读取端口、模型名及 tokenizer 路径。
 PD 模式将部署入口和 `--mode` 同时改为 `pd` 或 `pd_6p2d`；三种部署依次执行。
 
-aggre 启动至 READY 后，可用 `bash run_rate_sweep.sh` 顺序运行 rate
-**2、3、4、6、8、10、14**。每轮 300 请求、parallel=512、prefix=8000、input=1000、
-output=1000、warmup=0、metrics 间隔 1 秒，使用 chat 和内存生成的数据。
+pd 启动至 READY 后，可用 `bash run_rate_sweep.sh` 顺序运行 rate
+**2、4、6、8、10、12、14、16**。每轮 3000 请求、parallel=512、prefix=72000、input=8000、
+output=1000、warmup=0、metrics 间隔 1 秒，使用 chat。
+首次运行用 `/mnt/pfs/models/MiMo-V2.6-Flash-MOPD` 的 tokenizer 生成并保存 3000 条请求到脚本目录下的
+`datasets/MiMo-V2.6-Flash-MOPD/prefix72000_input8000_n3000_seed42.txt`；
+后续八个 rate 和再次执行脚本均读取同一文件，不再随机生成输入。
+读取阶段使用 `prepared_requests`，不加载客户端 tokenizer、不重复分词或做 token/字符长度检查，直接构造请求。
+输入和输出 token 数仅使用服务端返回的 `usage.prompt_tokens/completion_tokens`，流式请求开启 `include_usage`。
+缺少有效 usage 时实验报错，避免用字符数或流式 chunk 数估算 token。
+已有数据集必须可读、非空且恰好含 3000 条非空请求，否则停止扫描，不覆盖原文件；条数只在每次启动时检查一次。
 每个 rate 单独调用 `run_load.sh` 并清理 Prefix KV cache，结果和 metrics 独立保存，
-标签自动使用 `prefix8k_new1k_out1k_r<rate>`。任一轮失败会停止后续扫描。
-各轮沿用默认 seed，因此生成相同请求，便于比较速率。
-`bash run_rate_sweep.sh --dry-run` 可只检查七轮参数，不发请求或创建结果目录。
+标签自动使用 `prefix72k_new8k_out1000_r<rate>`。默认启用 `--allow-failed-requests`：
+本轮只要有成功请求，部分请求失败仅打印告警，保留失败计数和日志并继续后续 rate；
+manifest 标记 `completed_with_errors`，并在 `request_counts` 中记录成功/失败数量。
+整轮零成功、启动或运行异常、清缓存失败等仍停止扫描。
+输入数据复用与服务端清缓存互相独立；每档仍从清理后的 Prefix KV cache 开始。
+需要全新输入时可修改脚本中的 seed，文件名随之变化；更换 tokenizer 时请使用新的数据集路径。
+`bash run_rate_sweep.sh --dry-run` 可预览数据准备及八轮参数，不生成数据集、发请求或创建结果目录。
+复用时仍需读取文件和构造请求；EvalScope 仍可能显示 `Generating[requests]`，但不再对已保存文本进行分词。
 
 ### 每轮负载前清理 Prefix KV cache
 
@@ -73,10 +106,10 @@ running/waiting 为零且持续至少 6 秒，再 POST 重置接口并要求返�
 
 ### 镜像环境验证记录（2026-11-10）
 
-当前部署只使用镜像安装的 vLLM 0.31.0 和 Mooncake 0.3.13.post1，路径均在
+当时部署只使用镜像安装的 vLLM 0.31.0 和 Mooncake 0.3.13.post1，路径均在
 `/usr/local/lib/python3.12/dist-packages`。没有修改或安装镜像依赖。
 101 项回归测试通过，包含三个入口忽略外部源码/依赖路径的测试。
-以下实际推理验证当时使用 Marlin 和 TCP；当前默认已恢复 MoE 自动选择和 Mooncake RDMA，尚未重新进行 GPU 推理验证。
+以下实际推理验证当时使用 Marlin 和 TCP；当前默认使用 MoE 自动选择和 NIXL，尚未重新进行 GPU 推理验证。
 PD 实际部署通过 `per_dataset.py` 完成并发 1 / 2 各 2 请求：总成功 4、失败 0，
 输入 128、输出 16，已生成 CSV/XLSX/HTML。使用 Mooncake TCP 与 DFlash synthetic 接受长度 4.2。
 aggre 和 6P2D 本次仅做镜像环境预检，未重新执行完整推理测试。
@@ -112,7 +145,7 @@ bash deploy_pd_6p2d.sh
 
 NIXL 每端占用 `[起点, 起点 + DP - 1]`。对外监听 `0.0.0.0`，P/D 后端仅监听 `127.0.0.1`。负载客户端使用系统临时源端口，无需启动监听服务。跨机使用服务器实际 IP，不能使用 `0.0.0.0` 作为目标地址。
 
-三个部署脚本均完整、独立列出 GPU、TP、DP、EP、EPLB、投机等参数，支持环境变量覆盖。6P2D 不再调用 `deploy_pd.sh`；修改一个脚本的默认值不会改变其他脚本。默认模型 `/models/MiMo-V2.6-Flash-MOPD`，对外模型名 `MiMo-V2.6-Flash-MOPD`，三种模式各端均默认 `MAX_NUM_BATCHED_TOKENS=65536`、`MAX_NUM_SEQS=512`，EP/EPLB 开启；prefix caching 在 aggre 默认关闭、在 pd / pd_6p2d 默认开启，Nsight 关闭。这里 batch 表示每个引擎调度步的 token 预算，max_num_seqs 表示引擎允许的最大序列数，并非发射器的请求数或并发参数。
+三个部署脚本均完整、独立列出 GPU、TP、DP、EP、EPLB、投机等参数，支持环境变量覆盖。6P2D 不再调用 `deploy_pd.sh`；修改一个脚本的默认值不会改变其他脚本。默认模型 `/models/MiMo-V2.6-Flash-MOPD`，对外模型名 `MiMo-V2.6-Flash-MOPD`，三种模式各端均默认 `MAX_NUM_BATCHED_TOKENS=65536`，`MAX_NUM_SEQS` 在 aggre 为 32、在 pd / pd_6p2d 为 512；EP/EPLB 和 prefix caching 均默认开启，Nsight 关闭。这里 batch 表示每个引擎调度步的 token 预算，max_num_seqs 表示引擎允许的最大序列数，并非发射器的请求数或并发参数。
 
 ```bash
 # 仅打印完整配置和命令，不占 GPU、不写部署目录
@@ -126,14 +159,14 @@ MODEL_PATH=/models/example SERVED_MODEL_NAME=example \
   PROXY_PORT=19300 ENABLE_EP=1 bash deploy_pd.sh
 ```
 
-`PYTHON_BIN` 默认 `/usr/bin/python3`。部署仅复用 `aggre_or_not` 的命令构造、GPU/端口预检和进程管理；环境初始化由本目录独立实现，不使用其源码/依赖路径注入逻辑。服务、代理和部署控制进程均使用 `-I` 隔离模式。镜像缺少依赖时直接报错，不回退到工作区依赖，也不修改镜像中的包。
+`PYTHON_BIN` 默认 `/usr/bin/python3`。部署的命令构造、GPU/端口预检和进程管理使用本目录 `code/` 内的模块；环境初始化由本目录独立实现，不注入目录外的源码或依赖路径。服务、代理和部署控制进程均使用 `-I` 隔离模式。镜像缺少依赖时直接报错，不回退到工作区依赖，也不修改镜像中的包。
 
 接口提供 `/health`、`/v1/models`、`/v1/completions`、`/v1/chat/completions`。PD 请求先 prefill 再 decode，缺失 KV 传输元数据返回错误；支持流式输出并转发会话和请求标识。
 
 ### 选择 Mooncake 进行 P/D KV 传输
 
-`deploy_pd.sh` 和 `deploy_pd_6p2d.sh` 支持 `KV_CONNECTOR=MooncakeConnector`（默认）
-或 `KV_CONNECTOR=NixlConnector`。Mooncake 使用 `MooncakeConnector` 直接传输，
+`deploy_pd.sh` 和 `deploy_pd_6p2d.sh` 默认使用 `KV_CONNECTOR=NixlConnector`，
+也支持显式设置 `KV_CONNECTOR=MooncakeConnector`。Mooncake 使用 `MooncakeConnector` 直接传输，
 无需部署 Mooncake Store。当前 CUDA 13 镜像已安装
 `mooncake-transfer-engine-cuda13==0.3.13.post1`，部署脚本直接使用该包。
 
@@ -171,8 +204,9 @@ NIXL 的 `{"backends":["UCX"]}` 不能用于 Mooncake。GPU RDMA 注册还取决
 `KV_CONNECTOR=MooncakeConnector D_TP=2 D_DP=1 bash deploy_pd_6p2d.sh`；
 它会改变 decode 的并行方式，需重新评估性能。保持原拓扑则需要补齐 connector 的 padded-KV 重分片支持。
 
-当前两个 PD 脚本使用相同 TP2，避开上述异构 TP 限制，并保留已有的 DFlash + synthetic 接受长度 4.2 默认值。
-真实采样可显式设置 `SPECULATIVE_CONFIG=''`；关闭投机可设置 `SPECULATIVE_METHOD=none`。
+当前两个 PD 脚本使用相同 TP2，避开上述异构 TP 限制，且默认 `SPECULATIVE_METHOD=none`。
+aggre 默认启用 DFlash；各入口显式启用投机且未设置 `SPECULATIVE_CONFIG` 时，使用 synthetic 接受长度 4.2。
+真实采样需选择投机方法并显式设置 `SPECULATIVE_CONFIG=''`；关闭投机可设置 `SPECULATIVE_METHOD=none`。
 已显式设置的非空 `SPECULATIVE_CONFIG` 仍须与所选方法兼容。
 
 ### 独立设置 TP / DP / EP / EPLB
@@ -207,7 +241,7 @@ batch token 预算仍保持 65536。调整上下文长度后，应重新确认 K
 
 ### Prefix caching 开关
 
-每个部署脚本独立提供 `ENABLE_PREFIX_CACHING`，`1` 开启、`0` 关闭；aggre 默认 `0`，pd / pd_6p2d 默认 `1`。PD 模式同时应用到 P、D 两端。实际取值会保存到 `deployment.json`，启动命令只包含对应的一种开关。
+每个部署脚本独立提供 `ENABLE_PREFIX_CACHING`，`1` 开启、`0` 关闭；三个入口均默认 `1`。PD 模式同时应用到 P、D 两端。实际取值会保存到 `deployment.json`，启动命令只包含对应的一种开关。
 
 ```bash
 ENABLE_PREFIX_CACHING=1 bash deploy_aggre.sh
@@ -322,7 +356,7 @@ P/D 仍从部署文件中的后端地址直接采集；旧代理无法补采逐�
 
 ### 投机解码接口
 
-接口复用 `../profile/decode/speculative_config.py`，与 `../profile/decode/capture.sh` 的解析规则一致：
+接口使用本目录的 `code/speculative_config.py`，保留原 `profile/decode` 模块的解析规则：
 
 | 参数 | 默认值 | 用途 |
 |---|---|---|
@@ -332,7 +366,7 @@ P/D 仍从部署文件中的后端地址直接采集；旧代理无法补采逐�
 | `SPECULATIVE_CONFIG` | 空 | JSON 额外配置，覆盖同名基础参数；method 必须与 METHOD 一致 |
 
 `none` 不向 vLLM 传 `--speculative-config`；此时不能设置非空 `SPECULATIVE_CONFIG`。
-上表是通用接口默认值；当前两个 PD 入口已有 DFlash/synthetic 配置，见上面的说明。
+上表描述解析器的通用接口；部署脚本的实际默认值为：aggre 启用 DFlash/synthetic，两个 PD 入口关闭投机。三个入口均提供默认草稿模型路径 `/models/MiMo-V2.6-Flash-MOPD/dflash`。
 
 ```bash
 # MTP：使用目标模型的 MTP 权重
@@ -400,7 +434,7 @@ bash run_load.sh --perf-help
 
 默认负载为输入 1024、输出 500（适配三种部署的默认上下文；长上下文测试请显式设置长度）、每档 50 请求、1 轮、不预热；aggre 默认并发 `2 4 8 16`，PD 两种模式为 `2 4 8 16 32`。`--number` 单值广播到所有并发档，多值必须与 `--parallel` 等长。`--rate`、`--loop`、长度区间、数据集及 Header 参数沿用 `per_dataset.py`。多轮的 number 代表对话数。超时参数 `--read-timeout` 控制请求读取，duration 为软退出预算，不是强制终止时间。
 
-数据集可以通过 `per_dataset.py --prepare-dataset` 预生成，再用 `--prepared-dataset-path` 或 `--multi-turn-dataset custom_multi_turn --multi-turn-dataset-path` 复用。请显式提供数据集路径，避免工作目录中的默认 `prompts_random.txt` 意外影响实验。单轮自定义文本无需 tokenizer 时可传 `--tokenizer-path ''`，此时依赖服务返回 usage；随机负载必须提供有效 tokenizer。
+数据集可以通过 `per_dataset.py --prepare-dataset` 预生成，再用 `--prepared-dataset-path` 或 `--multi-turn-dataset custom_multi_turn --multi-turn-dataset-path` 复用。请显式提供数据集路径，避免工作目录中的默认 `prompts_random.txt` 意外影响实验。单轮已保存数据自动跳过客户端 tokenizer 和长度检查，token 数依赖服务返回的完整 usage；随机生成仍必须提供有效 tokenizer。多轮数据沿用 EvalScope 的多轮处理方式。
 
 ### 保存并复用共享前缀数据集
 
@@ -412,9 +446,9 @@ bash run_load.sh --prepare-dataset --prepare-num 3000 \
   --prefix-length 8000 --input-length 1000 \
   --prepared-dataset-path datasets/prefix8000_suffix1000_n3000_seed42.txt
 
-# 后续重复执行：读取上述文件，跳过随机生成；每次评估结果仍单独保存。
+# 后续重复执行：直接读取上述文件，不做客户端分词；每次评估结果仍单独保存。
 bash run_load.sh --mode aggre --use-chat \
-  --tokenizer-path /models/MiMo-V2.6-Flash-MOPD \
+  --tokenizer-path '' \
   --prepared-dataset-path datasets/prefix8000_suffix1000_n3000_seed42.txt \
   --prefix-length 8000 --input-length 1000 --output-length 1000 \
   --number 3000 --parallel 512 --rate 14 --warmup-num 0 \
@@ -425,8 +459,11 @@ bash run_load.sh --mode aggre --use-chat \
 前 8000 个 token 一致、每条总长 9000 个 token，且完整 prompt 不重复；
 长度不含服务端聊天模板。使用同一个 tokenizer 和模板时，共享内容保持一致。
 没有前缀的旧生成模式及多轮模式仍使用原来的采样方式，重新分词后的长度可能变化。
-文件复用时已包含前后缀，传入的 `prefix-length/input-length` 仅用于实验参数记录，
-不会再次拼接或截断文件内容。3000 条文件建议配合 `--number 3000 --warmup-num 0`；
+单轮文件复用时已包含前后缀，传入的 `prefix-length/input-length` 仅用于实验参数记录，
+不会再次拼接、截断或按长度过滤文件内容。每行可为完整文本、messages JSON 数组或完整请求 JSON 对象；
+文本按当前 chat/completions 模式包装，JSON 沿用 EvalScope 的参数合并规则。
+读取时忽略传入的 tokenizer 路径，服务端仍负责聊天模板和分词，并通过 usage 返回实际 token 数。
+3000 条文件建议配合 `--number 3000 --warmup-num 0`；
 超过文件条数（包括 warmup）时 EvalScope 会循环读取，后缀也会重复。
 
 `parallel` 是同时未完成 HTTP 请求的上限，`rate` 是整个发射器的目标调度速率（请求/秒），
@@ -460,7 +497,11 @@ results/<模式>/<模型>/<负载摘要_标签_参数哈希>/<微秒时间戳_UU
       ...                   # EvalScope 原始报告、时间线等
 ```
 
-每次目录排他创建，同模型同负载重复执行或同时运行不会覆盖。每个 loop/sweep 单独存储，只汇总本次结果；失败也保留日志和已有产物，manifest 标记 `failed` 或 `interrupted`，发射器返回非零。出现零成功请求或失败请求时仍导出可用汇总，然后返回非零。Ctrl-C 仅停止本次发射器。
+每次目录排他创建，同模型同负载重复执行或同时运行不会覆盖。每个 loop/sweep 单独存储，只汇总本次结果；失败也保留日志和已有产物，manifest 标记 `failed` 或 `interrupted`，发射器返回非零。
+单独调用 `run_load.sh` 或 `per_dataset.py` 默认仍在零成功或存在失败请求时返回非零；
+加上 `--allow-failed-requests` 后，有成功请求的评估即使包含失败请求也会保存汇总、告警并正常退出，
+`run_load.sh` 将这种情况归档为 `completed_with_errors`。`run_rate_sweep.sh` 已默认加上该参数。
+不自动重试或补发失败请求，保留原请求数与 rate 设置；零成功仍返回非零。Ctrl-C 仅停止本次发射器。
 
 `run_load.sh` 统一管理输出路径，使用 `--results-root` 修改根目录。直接调用 `per_dataset.py` 可用 `--output-dir` 指定**尚不存在**的独占目录，并使用 `--output-csv`、`--output-xlsx`、`--output-req-map` 自定义文件名；不指定目录时自动生成唯一目录。汇总兼容旧版与 EvalScope 1.14 的吞吐、TPOT 字段，其他原始指标原样保留。
 

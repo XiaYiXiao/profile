@@ -38,8 +38,11 @@ def test_default_switches(mode, ep, eplb):
         assert server['ep'] is ep and server['eplb'] is eplb
         assert ('--enable-expert-parallel' in server['command']) is ep
         assert ('--enable-eplb' in server['command']) is eplb
-        assert server['speculative_config']['method'] == 'dflash'
-        assert server['speculative_config']['synthetic_acceptance_length'] == 4.2
+        if mode == 'aggre':
+            assert server['speculative_config']['method'] == 'dflash'
+            assert server['speculative_config']['synthetic_acceptance_length'] == 4.2
+        else:
+            assert server['speculative_config'] is None
 
 
 @pytest.mark.parametrize('mode', ['aggre', 'pd', 'pd_6p2d'])
@@ -154,7 +157,8 @@ def test_invalid_prefix_caching_switch():
 @pytest.mark.parametrize('mode,bootstrap_port', [('pd', 6500), ('pd_6p2d', 6600)])
 @pytest.mark.parametrize('connector', ['NixlConnector', 'MooncakeConnector'])
 def test_pd_connector_commands(mode, bootstrap_port, connector):
-    result, cfg = preview(mode, KV_CONNECTOR=connector, SPECULATIVE_CONFIG='',
+    result, cfg = preview(mode, KV_CONNECTOR=connector,
+                          SPECULATIVE_METHOD='dflash', SPECULATIVE_CONFIG='',
                           KV_EXTRA_CONFIG='{"mooncake_protocol":"rdma"}' if connector == 'MooncakeConnector' else '{}')
     assert result.returncode == 0, result.stderr
     assert cfg['kv_connector'] == connector
@@ -208,7 +212,8 @@ def test_mooncake_options_and_speculation_can_be_overridden():
 def test_container_transport_and_backend_defaults():
     result, cfg = preview('pd')
     assert result.returncode == 0, result.stderr
-    assert cfg['kv_extra_config']['mooncake_protocol'] == 'rdma'
+    assert cfg['kv_connector'] == 'NixlConnector'
+    assert cfg['kv_extra_config'] == {}
     for server in cfg['servers']:
         cmd = server['command']
         assert '--moe-backend' not in cmd

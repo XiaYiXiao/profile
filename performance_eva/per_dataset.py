@@ -40,7 +40,7 @@
        --input-length 1024 \\
        --tokenizer-path /data/models/your-model \\
        --prepared-dataset-path prompts.txt
-   # 之后所有 perf 跑都复用（文件存在 → 自动切到 line_by_line）
+   # 之后所有 perf 跑都复用（文件存在 → 直接构造请求，跳过分词和长度检查）
    python per_dataset.py \\
        --parallel 8 --number 5000 \\
        --prepared-dataset-path prompts.txt ...
@@ -115,7 +115,43 @@ from openpyxl.utils.dataframe import dataframe_to_rows
 from evalscope.perf.arguments import Arguments
 from evalscope.perf.main import run_perf_benchmark
 from evalscope.perf.plugin.api.openai_api import OpenaiPlugin
-from evalscope.perf.plugin.registry import register_api
+from evalscope.perf.plugin.datasets.line_by_line import LineByLineDatasetPlugin
+from evalscope.perf.plugin.registry import register_api, register_dataset
+
+
+@register_dataset('prepared_requests')
+class _PreparedRequestsDataset(LineByLineDatasetPlugin):
+    """Read saved prompts verbatim, without tokenization or length filtering."""
+
+    def prepare_messages(self, prompt):
+        # No tokenizer also makes EvalScope's normal length check use characters,
+        # which can discard long prompts. Bypass that check, not just tokenization.
+        if self.query_parameters.apply_chat_template:
+            return [{'role': 'user', 'content': prompt}]
+        return prompt
+
+
+class _ServerUsageOnly:
+    """Use authoritative server counts; never estimate tokens from text/chunks."""
+
+    def parse_responses(self, responses, request=None, **kwargs):
+        for response in reversed(responses):
+            usage = response.get('usage') if isinstance(response, dict) else None
+            if not isinstance(usage, dict):
+                continue
+            counts = (usage.get('prompt_tokens'), usage.get('completion_tokens'))
+            if all(type(count) is int and count >= 0 for count in counts):
+                return counts
+        raise ValueError(
+            '已保存数据集使用服务端 token 统计，但响应缺少有效的 '
+            'usage.prompt_tokens / usage.completion_tokens；'
+            '请确保服务及代理返回完整 usage（流式请求已启用 include_usage）。'
+        )
+
+
+@register_api('openai_server_usage')
+class _ServerUsageOpenaiPlugin(_ServerUsageOnly, OpenaiPlugin):
+    pass
 
 
 @register_api('openai_session')
@@ -330,6 +366,11 @@ class _OpenaiSessionPlugin(OpenaiPlugin):
             writer.writerow(headers)
             writer.writerows(cls.req_mapping)
         print(f"请求四元ID映射明细已保存至: {output_path}")
+
+
+@register_api('openai_session_server_usage')
+class _ServerUsageSessionPlugin(_ServerUsageOnly, _OpenaiSessionPlugin):
+    pass
 
 
 def _sample_random_prompts(
@@ -701,6 +742,11 @@ def parse_csv_to_xlsx(in_csv, out_xlsx):
 @click.option("--name", type=str, default="appauto-bench", show_default=True, help="任务名称")
 @click.option("--test-connection", is_flag=True, show_default=True)
 @click.option("--debug", is_flag=True, show_default=True)
+@click.option(
+    "--allow-failed-requests",
+    is_flag=True,
+    help="存在成功请求时，允许部分请求失败并继续；失败计数保留，零成功仍报错。",
+)
 @click.option("--use-chat", is_flag=True, show_default=True)
 @click.option("--output-dir", type=click.Path(file_okay=False), default=None, help="本次运行的独占输出目录，必须不存在")
 @click.option("--seed", type=int, default=42, show_default=True)
@@ -802,7 +848,7 @@ def parse_csv_to_xlsx(in_csv, out_xlsx):
     help=(
         "仅预生成 random 数据集到本地文本文件并退出（不跑压测）。\n"
         "  开启时：写到 --prepared-dataset-path，拒绝覆盖；单轮支持共享 --prefix-length；\n"
-        "  关闭时：若 --prepared-dataset-path 已存在则自动用 --dataset line_by_line 复用；\n"
+        "  关闭时：若 --prepared-dataset-path 已存在则直接读取，跳过分词/长度检查，token 数使用服务端 usage；\n"
         "          否则走原有的 --dataset random 重新生成（保持原行为）。"
     )
 )
@@ -811,7 +857,7 @@ def parse_csv_to_xlsx(in_csv, out_xlsx):
     type=str,
     default="prompts_random.txt",
     show_default=True,
-    help="数据集本地路径，每行一个完整 prompt；复用时不再追加 prefix 或调整 input-length。"
+    help="数据集本地路径，每行一个完整 prompt；复用时跳过客户端分词及长度检查，不再追加 prefix 或调整 input-length。"
 )
 @click.option(
     "--prepare-num",
@@ -844,6 +890,7 @@ def runner(
     loop,
     name,
     debug,
+    allow_failed_requests,
     use_chat,
     test_connection,
     output_dir,
@@ -1099,13 +1146,20 @@ def runner(
                     multi_kwargs["max_prompt_length"] = in_max
                 task_cfg = Arguments(**common_kwargs, **multi_kwargs)
             else:
-                # 单轮模式：若 --prepared-dataset-path 存在则切到 line_by_line，否则走 random
+                # Saved single-turn prompts were prepared separately. Reuse them
+                # without loading a client tokenizer or filtering by token/char length.
                 if prepared_dataset_path and os.path.isfile(prepared_dataset_path):
                     if i == 0 and p == parallel_list[0]:
-                        print(f"[预生成复用] line_by_line ← {prepared_dataset_path}")
+                        print(f"[预生成复用] prepared_requests ← {prepared_dataset_path}")
+                        print('[预生成复用] 直接构造请求，跳过客户端分词和长度检查；token 数使用服务端 usage。')
+                    prepared_kwargs = dict(
+                        common_kwargs,
+                        tokenizer_path=None,
+                        api='openai_session_server_usage' if use_custom_plugin else 'openai_server_usage',
+                    )
                     task_cfg = Arguments(
-                        **common_kwargs,
-                        dataset="line_by_line",
+                        **prepared_kwargs,
+                        dataset="prepared_requests",
                         dataset_path=prepared_dataset_path,
                     )
                 else:
@@ -1127,8 +1181,17 @@ def runner(
                 # EvalScope versions use slightly different spellings.
                 success = summary.get("Success Requests", summary.get("Succeed Requests", 0))
                 failed = summary.get("Failed Requests", 0)
-                if float(success) <= 0 or float(failed) > 0:
+                if float(success) <= 0:
                     failed_sweeps.append(str(summary_path))
+                elif float(failed) > 0:
+                    if allow_failed_requests:
+                        click.echo(
+                            f"[警告] 本轮成功 {success} 条、失败 {failed} 条；"
+                            f"已启用 --allow-failed-requests，保留失败记录并继续。结果: {summary_path}",
+                            err=True,
+                        )
+                    else:
+                        failed_sweeps.append(str(summary_path))
             if write_csv:
                 extract_json_to_csv(json_dir, output_csv,
                                     str(in_len_range) if in_len_range else input_length,

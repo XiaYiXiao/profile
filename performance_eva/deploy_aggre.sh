@@ -35,11 +35,11 @@ export EPLB_NUM_REDUNDANT_EXPERTS="${EPLB_NUM_REDUNDANT_EXPERTS:-0}"
 export EPLB_USE_ASYNC="${EPLB_USE_ASYNC:-true}" EPLB_CONFIG="${EPLB_CONFIG:-}"
 
 # ==================== 投机解码：none / mtp / dflash ====================
-# 与 profiler/profile/decode/capture.sh 接口一致；默认 none 保持普通推理。
+# 由本目录 code/speculative_config.py 解析；保留当前 DFlash 默认配置。
 export SPECULATIVE_METHOD="${SPECULATIVE_METHOD:-dflash}"
 export NUM_SPECULATIVE_TOKENS="${NUM_SPECULATIVE_TOKENS:-7}"
 export DRAFT_MODEL_PATH="${DRAFT_MODEL_PATH-/models/MiMo-V2.6-Flash-MOPD/dflash}" # 显式空值用于 MTP；DFlash 必须提供模型
-if [[ ! -v SPECULATIVE_CONFIG ]]; then
+if [[ "${SPECULATIVE_CONFIG+x}" != x ]]; then
   SPECULATIVE_CONFIG='{
   "rejection_sample_method": "synthetic",
   "synthetic_acceptance_length": 4.2

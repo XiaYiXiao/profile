@@ -14,7 +14,7 @@ import httpx
 import pandas as pd
 import pytest
 from fastapi import FastAPI, Request
-from fastapi.responses import StreamingResponse
+from fastapi.responses import JSONResponse, StreamingResponse
 from fastapi.testclient import TestClient
 import uvicorn
 
@@ -197,17 +197,21 @@ def mock_server():
         return {'status': 'ok'}
     @app.get('/v1/models')
     def models():
-        return {'data': [{'id': 'test-model'}]}
+        return {'data': [{'id': 'test-model'}, {'id': 'missing-usage'}, {'id': 'partial-failures'}]}
     @app.post('/v1/completions')
     @app.post('/v1/chat/completions')
     async def completions(req: Request):
         body = await req.json()
+        prompt = body.get('prompt') or body.get('messages', [{}])[0].get('content')
+        if body['model'] == 'partial-failures' and prompt == 'fail':
+            return JSONResponse({'error': 'simulated request failure'}, status_code=503)
         async def chunks():
             for token in ('hello', ' world', '!'):
                 choice = {'index': 0, 'delta': {'content': token}, 'finish_reason': None} if 'messages' in body else {'index': 0, 'text': token, 'finish_reason': None}
                 yield 'data: ' + json.dumps({'id': 'mock', 'object': 'chat.completion.chunk', 'model': 'test-model', 'choices': [choice]}) + '\n\n'
                 await asyncio.sleep(0.01)
-            yield 'data: ' + json.dumps({'choices': [], 'usage': {'prompt_tokens': 5, 'completion_tokens': 3, 'total_tokens': 8}}) + '\n\n'
+            if body['model'] != 'missing-usage':
+                yield 'data: ' + json.dumps({'choices': [], 'usage': {'prompt_tokens': 5, 'completion_tokens': 3, 'total_tokens': 8}}) + '\n\n'
             yield 'data: [DONE]\n\n'
         return StreamingResponse(chunks(), media_type='text/event-stream')
     sock = socket.socket()
@@ -276,10 +280,55 @@ def test_concurrent_identical_runs(tmp_path, mock_server):
         assert len(pd.read_csv(path.parent / 'perf/summary.csv')) == 1
 
 
+def test_saved_requests_fail_when_server_omits_usage(tmp_path, mock_server):
+    dataset = tmp_path / 'prompts.txt'
+    dataset.write_text('saved prompt\n')
+    command = [sys.executable, str(BASE / 'per_dataset.py'),
+               '--port', str(mock_server), '--model', 'missing-usage', '--use-chat',
+               '--tokenizer-path', '', '--prepared-dataset-path', str(dataset),
+               '--parallel', '1', '--number', '1', '--output-length', '3',
+               '--output-dir', str(tmp_path / 'results'), '--no-write-csv', '--allow-failed-requests']
+    result = subprocess.run(command, capture_output=True, text=True, timeout=45)
+    assert result.returncode != 0
+    assert 'usage.prompt_tokens / usage.completion_tokens' in result.stdout + result.stderr
+
+
+@pytest.mark.parametrize('allow_failed, prompts, expected_success, expected_status', [
+    (False, ['fail', 'hello'], 1, 'failed'),
+    (True, ['fail', 'hello'], 1, 'completed_with_errors'),
+    (True, ['fail', 'fail'], 0, 'failed'),
+])
+def test_request_failure_policy_with_real_evalscope(
+        tmp_path, mock_server, allow_failed, prompts, expected_success, expected_status):
+    dataset = tmp_path / 'prompts.txt'
+    dataset.write_text('\n'.join(prompts) + '\n')
+    command = ['bash', str(BASE / 'run_load.sh'), '--no-reset-prefix-cache', '--no-server-metrics',
+               '--results-root', str(tmp_path / 'results'), '--port', str(mock_server),
+               '--model', 'partial-failures', '--tokenizer-path', '', '--use-chat',
+               '--prepared-dataset-path', str(dataset), '--parallel', '1', '--number', '2',
+               '--output-length', '3']
+    if allow_failed:
+        command.append('--allow-failed-requests')
+    result = subprocess.run(command, env=dict(os.environ, LOAD_PYTHON_BIN=sys.executable),
+                            capture_output=True, text=True, timeout=60)
+    assert (result.returncode == 0) == (expected_status == 'completed_with_errors'), result.stdout + result.stderr
+    manifest_path, = (tmp_path / 'results').rglob('manifest.json')
+    manifest = json.loads(manifest_path.read_text())
+    assert manifest['status'] == expected_status
+    frame = pd.read_csv(manifest_path.parent / 'perf/summary.csv')
+    assert frame['Success Requests'].tolist() == [expected_success]
+    assert frame['Failed Requests'].tolist() == [2 - expected_success]
+    assert (manifest_path.parent / 'perf/summary.xlsx').is_file()
+    if expected_status == 'completed_with_errors':
+        assert manifest['request_counts'] == {'success': 1, 'failed': 1}
+        assert '保留失败记录并继续' in result.stdout
+        assert '本轮成功 1 条、失败 1 条' in (manifest_path.parent / 'load.log').read_text()
+
+
 def test_reset_failure_prevents_load_and_is_archived(tmp_path, mock_server):
     command = ['bash', str(BASE / 'run_load.sh'), '--results-root', str(tmp_path / 'results'),
                '--port', str(mock_server), '--model', 'test-model', '--tokenizer-path', '',
-               '--parallel', '1', '--number', '1', '--no-server-metrics']
+               '--parallel', '1', '--number', '1', '--no-server-metrics', '--allow-failed-requests']
     result = subprocess.run(command, env=dict(os.environ, LOAD_PYTHON_BIN=sys.executable),
                             capture_output=True, text=True, timeout=30)
     assert result.returncode != 0
@@ -332,6 +381,33 @@ def test_failed_metrics_preserve_summary(tmp_path, monkeypatch):
     result = CliRunner().invoke(per_dataset.runner, ['--output-dir', str(root), '--parallel', '1', '--number', '2'])
     assert result.exit_code != 0
     assert (root / 'summary.csv').is_file() and (root / 'summary.xlsx').is_file()
+
+
+def test_allowed_failed_requests_keep_counts_and_continue(tmp_path, monkeypatch):
+    sys.path.insert(0, str(BASE))
+    import per_dataset
+    from click.testing import CliRunner
+
+    seen = []
+    def partial_perf(args):
+        seen.append(args.parallel[0])
+        root = Path(args.outputs_dir)
+        root.mkdir(parents=True)
+        (root / 'benchmark_summary.json').write_text(json.dumps({
+            'Success Requests': 1 if len(seen) == 1 else 2,
+            'Failed Requests': 1 if len(seen) == 1 else 0,
+        }))
+
+    monkeypatch.setattr(per_dataset, 'run_perf_benchmark', partial_perf)
+    root = tmp_path / 'partial'
+    result = CliRunner().invoke(per_dataset.runner, [
+        '--output-dir', str(root), '--parallel', '1 2', '--number', '2', '--allow-failed-requests',
+    ])
+    assert result.exit_code == 0, result.output + repr(result.exception)
+    assert seen == [1, 2]
+    assert '保留失败记录并继续' in result.output
+    assert pd.read_csv(root / 'summary.csv')['Failed Requests'].tolist() == [1, 0]
+    assert (root / 'summary.xlsx').is_file()
 
 
 def test_load_uses_deployed_tokenizer_with_explicit_override(tmp_path):

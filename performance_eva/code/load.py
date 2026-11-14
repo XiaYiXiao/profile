@@ -203,7 +203,14 @@ def main():
             time.sleep(args.metrics_settle_seconds)
         if code:
             raise RuntimeError(f'per_dataset.py exited with status {code}; see load.log')
-        manifest['status'] = 'completed'
+        # A tolerated request failure is still visible in the archived outcome.
+        request_counts = dict(success=0, failed=0)
+        for summary_path in (root / 'perf').rglob('benchmark_summary.json'):
+            summary = json.loads(summary_path.read_text())
+            request_counts['success'] += int(summary.get('Success Requests', summary.get('Succeed Requests', 0)))
+            request_counts['failed'] += int(summary.get('Failed Requests', 0))
+        manifest['request_counts'] = request_counts
+        manifest['status'] = 'completed_with_errors' if request_counts['failed'] else 'completed'
         return 0
     except KeyboardInterrupt:
         manifest.update(status='interrupted', error='Load interrupted')

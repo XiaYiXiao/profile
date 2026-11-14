@@ -1,8 +1,11 @@
 __pycache__/
 .pytest_cache/
+.DS_Store
+.venv/
 .venv-load/
 .cache/
 .tmp/
+datasets/
 deployments/
 results/
 outputs/

@@ -61,11 +61,17 @@ def test_cli_prepare_and_reuse_without_regeneration(tmp_path, tokenizer, monkeyp
         pytest.fail('Reuse must not regenerate the dataset')
 
     def fake_perf(args):
-        from evalscope.perf.plugin.datasets.line_by_line import LineByLineDatasetPlugin
-        assert args.dataset == 'line_by_line'
+        from evalscope.perf.plugin.registry import ApiRegistry, DatasetRegistry
+        assert args.dataset == 'prepared_requests'
+        assert args.tokenizer_path is None
+        assert args.api == 'openai_server_usage'
         assert args.min_tokens == args.max_tokens == 1000
-        rows = list(LineByLineDatasetPlugin(args).build_messages())
+        rows = list(DatasetRegistry.get_class(args.dataset)(args).build_messages())
         assert [row[0]['content'] for row in rows] == dataset.read_text().splitlines()
+        plugin = ApiRegistry.get_class(args.api)(args)
+        assert plugin.tokenizer is None
+        assert plugin.build_request(rows[0])['stream_options'] == {'include_usage': True}
+        assert plugin.parse_responses([{'usage': {'prompt_tokens': 59, 'completion_tokens': 1000}}]) == (59, 1000)
         root = Path(args.outputs_dir)
         root.mkdir(parents=True)
         (root / 'benchmark_summary.json').write_text(json.dumps({
@@ -73,6 +79,8 @@ def test_cli_prepare_and_reuse_without_regeneration(tmp_path, tokenizer, monkeyp
         }))
 
     monkeypatch.setattr(per_dataset, 'build_random_dataset', should_not_generate)
+    for module in ('datasets.base', 'api.openai_api'):
+        monkeypatch.setattr(f'evalscope.perf.plugin.{module}.load_tokenizer', should_not_generate)
     monkeypatch.setattr(per_dataset, 'run_perf_benchmark', fake_perf)
     result = cli.invoke(per_dataset.runner, [
         '--use-chat', '--tokenizer-path', 'test', '--parallel', '4', '--number', '4',
@@ -82,6 +90,89 @@ def test_cli_prepare_and_reuse_without_regeneration(tmp_path, tokenizer, monkeyp
     ])
     assert result.exit_code == 0, result.output + repr(result.exception)
     assert dataset.read_bytes() == original
+
+
+@pytest.mark.parametrize('chat', [False, True])
+@pytest.mark.parametrize('session_headers', [False, True])
+def test_saved_long_prompts_skip_all_length_checks(tmp_path, monkeypatch, chat, session_headers):
+    from evalscope.perf.plugin.datasets.base import DatasetPluginBase
+    from evalscope.perf.plugin.registry import ApiRegistry, DatasetRegistry
+
+    # Longer than EvalScope's default 131072 limit in *characters* as well.
+    prompts = ['中文长前缀' * 40000 + ' suffix-a', 'another prompt']
+    dataset = tmp_path / 'saved.txt'
+    dataset.write_text('\n'.join(prompts) + '\n', encoding='utf-8')
+    original = dataset.read_bytes()
+
+    def forbidden(*args, **kwargs):
+        pytest.fail('Saved prompts must not load a tokenizer or check lengths')
+
+    for module in ('datasets.base', 'api.openai_api'):
+        monkeypatch.setattr(f'evalscope.perf.plugin.{module}.load_tokenizer', forbidden)
+    monkeypatch.setattr(DatasetPluginBase, 'check_prompt_length', forbidden)
+
+    def fake_perf(args):
+        assert args.tokenizer_path is None
+        assert args.api == ('openai_session_server_usage' if session_headers else 'openai_server_usage')
+        rows = list(DatasetRegistry.get_class(args.dataset)(args).build_messages())
+        expected = [[{'role': 'user', 'content': prompt}] for prompt in prompts] if chat else prompts
+        assert rows == expected
+        api = ApiRegistry.get_class(args.api)(args)
+        body = api.build_request(rows[0])
+        assert body['messages' if chat else 'prompt'] == expected[0]
+        assert body['stream_options']['include_usage'] is True
+        assert api.parse_responses([
+            {'choices': [{'delta': {'content': 'one chunk'}}], 'usage': None},
+            {'usage': {'prompt_tokens': 80017, 'completion_tokens': 1000}},
+        ]) == (80017, 1000)
+        Path(args.outputs_dir).mkdir(parents=True)
+        (Path(args.outputs_dir) / 'benchmark_summary.json').write_text(json.dumps({
+            'Success Requests': 2, 'Failed Requests': 0,
+        }))
+
+    monkeypatch.setattr(per_dataset, 'run_perf_benchmark', fake_perf)
+    options = ['--prepared-dataset-path', str(dataset), '--tokenizer-path', 'must-not-be-loaded',
+               '--parallel', '1', '--number', '2', '--output-dir', str(tmp_path / 'results'),
+               '--no-write-csv']
+    if chat:
+        options.append('--use-chat')
+    if session_headers:
+        options.append('--inject-req-ids')
+    result = CliRunner().invoke(per_dataset.runner, options)
+    assert result.exit_code == 0, result.output + repr(result.exception)
+    assert dataset.read_bytes() == original
+
+
+@pytest.mark.parametrize('usage', [None, {}, {'prompt_tokens': 12},
+                                  {'prompt_tokens': 12, 'completion_tokens': None},
+                                  {'prompt_tokens': -1, 'completion_tokens': 2}])
+def test_saved_requests_require_server_usage(usage):
+    parser = per_dataset._ServerUsageOnly()
+    with pytest.raises(ValueError, match='usage.prompt_tokens'):
+        parser.parse_responses([{'usage': usage, 'choices': [{'text': 'not a token count'}]}])
+
+
+def test_saved_json_messages_and_request_body_are_preserved(tmp_path):
+    from evalscope.perf.arguments import Arguments
+    from evalscope.perf.plugin.registry import ApiRegistry, DatasetRegistry
+
+    messages = [{'role': 'system', 'content': 'system'}, {'role': 'user', 'content': 'saved input'}]
+    body = {'messages': messages, 'max_tokens': 17, 'temperature': 0.7}
+    dataset = tmp_path / 'saved.jsonl'
+    dataset.write_text(json.dumps(messages) + '\n' + json.dumps(body) + '\n')
+    args = Arguments(model='test', url='http://localhost:9999/v1/chat/completions',
+                     api='openai_server_usage', dataset='prepared_requests',
+                     dataset_path=str(dataset), tokenizer_path=None,
+                     parallel=[1], number=[2], max_tokens=1000, stream=True)
+    rows = list(DatasetRegistry.get_class(args.dataset)(args).build_messages())
+    assert rows == [messages, body]
+    api = ApiRegistry.get_class(args.api)(args)
+    assert api.build_request(rows[0])['messages'] == messages
+    payload = api.build_request(rows[1])
+    assert payload['messages'] == messages
+    assert payload['max_tokens'] == 17 and payload['temperature'] == 0.7
+    assert payload['stream_options'] == {'include_usage': True}
+    assert api.parse_responses([{'usage': {'prompt_tokens': 0, 'completion_tokens': 0}}]) == (0, 0)
 
 
 def test_existing_file_is_preserved(tmp_path, tokenizer):

@@ -1,7 +1,6 @@
-"""Serve persistently using the capture scripts' vLLM command builder (no workloads)."""
+"""Serve persistently using the bundled vLLM command builder (no workloads)."""
 import json
 import importlib.metadata
-import importlib.util
 import math
 import os
 from pathlib import Path
@@ -17,14 +16,13 @@ from uuid import uuid4
 BASE = Path(__file__).resolve().parents[1]
 # -I excludes the script directory; add only our orchestration helpers.
 sys.path.insert(0, str(BASE / 'code'))
-# Share command construction and process ownership with the reference experiments.
-# Importing collect_pd does not invoke its collection entry point.
-sys.path.insert(0, str(BASE.parent / 'aggre_or_not/code'))
-from collect_pd import (enabled, integer, model_parallelism_check,
-                        preflight as reference_preflight,
-                        resolve_eplb, server_command as reference_server_command)
+from deploy_common import (enabled, integer, model_parallelism_check,
+                           preflight as base_preflight,
+                           server_command as base_server_command)
+from eplb_config import resolve as resolve_eplb
 from runtime import launch, terminate_all, server_children
 from server_metrics import MetricsCollector, positive_seconds
+from speculative_config import resolve as resolve_speculative
 
 
 def prepare_environment(cfg):
@@ -54,18 +52,9 @@ def prepare_environment(cfg):
     e['VLLM_KV_CACHE_LAYOUT'] = e.get('KV_CACHE_LAYOUT', 'LBHNC')
 
 
-def resolve_speculative():
-    """Use exactly the same JSON merge/validation as decode/capture.sh."""
-    source = BASE.parent / 'profile/decode/speculative_config.py'
-    spec = importlib.util.spec_from_file_location('decode_speculative_config', source)
-    module = importlib.util.module_from_spec(spec)
-    spec.loader.exec_module(module)
-    return module.resolve()
-
-
 def server_command(cfg, server):
     # Reuse model/runtime flags without injecting the reference NIXL transport.
-    cmd = reference_server_command(dict(cfg, mode='aggre'), server)
+    cmd = base_server_command(dict(cfg, mode='aggre'), server)
     cmd[cmd.index('-m') + 1] = 'vllm.entrypoints.cli.main'
     cmd.insert(cmd.index('-m'), '-I')
     if cfg['mode'] != 'pd':
@@ -89,9 +78,9 @@ def server_command(cfg, server):
 
 def preflight(cfg):
     if cfg.get('kv_connector') != 'MooncakeConnector':
-        return reference_preflight(cfg)
+        return base_preflight(cfg)
     # Keep model, GPU occupancy and port checks; skip the NIXL-specific probe.
-    result = reference_preflight(dict(cfg, mode='aggre'))
+    result = base_preflight(dict(cfg, mode='aggre'))
     from vllm.distributed.kv_transfer.kv_connector.v1.mooncake.mooncake_connector import TransferEngine
     if TransferEngine is None:
         raise RuntimeError('Mooncake is unavailable in the deployment Python environment')
